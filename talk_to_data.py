@@ -637,7 +637,7 @@ class CodeEditorNode(Node):
     # 
 
     def _log_safe(self, msg):
-        """Emit msg to LangFlow's logger when available, else stderr.
+        """Emit msg to the host logger when available, else stderr.
 
         Callers in `auto` mode need a place to surface Indirect-branch errors
         without crashing the whole run. Using self.log directly would raise on
@@ -651,6 +651,26 @@ class CodeEditorNode(Node):
                 print(f"[talk_to_data] {msg}", file=sys.stderr, flush=True)
             except Exception:
                 pass
+
+    def _llm_invoke_silent(self, prompt):
+        """Invoke self.llm while suppressing agent-level callback events.
+
+        Without this, every internal LLM call inside this tool (Stage 2 schema
+        linker, Stage 4 SQL generator, combined-summary merge, retry judge)
+        emits an `add_message` SSE event. The Playground filters those out, but
+        the Orchestration / MyBuddy chat page forwards them all to the UI —
+        causing raw Stage 2 JSON and raw Stage 4 SQL to appear after the
+        formatted tables.
+
+        Passing config={"callbacks": []} tells any LangChain-style runnable to
+        skip its callback handlers for just this call, so the SSE event is
+        never produced. Older LLM wrappers that don't accept a RunnableConfig
+        fall back to the plain invoke path (behavior unchanged for them).
+        """
+        try:
+            return self.llm.invoke(prompt, config={"callbacks": []})
+        except TypeError:
+            return self.llm.invoke(prompt)
 
     @staticmethod
     def _fmt_money_str(val):
@@ -815,7 +835,7 @@ class CodeEditorNode(Node):
             "8. Money/spend/amount values in the input are ALREADY K/M-formatted (e.g. '45.3M', '892.1K'). Preserve that formatting — do NOT re-scale or expand them. To SUM values, parse the K/M suffix back to a number, add, then re-format the sum with K/M. Non-money columns (counts, IDs, etc.) use plain commas.\n"
         )
 
-        response = self.llm.invoke(prompt)
+        response = self._llm_invoke_silent(prompt)
         text = response.content if hasattr(response, "content") else str(response)
         text = text.strip()
 
@@ -1317,7 +1337,7 @@ Return ONLY JSON."""
 
         schema_linking = {}
         try:
-            response = self.llm.invoke(prompt)
+            response = self._llm_invoke_silent(prompt)
             text = response.content if hasattr(response, "content") else str(response)
             text = text.strip()
             if text.startswith("```json"):
@@ -1806,7 +1826,7 @@ Return ONLY JSON."""
             if not prompt_text:
                 return {**ctx, "generated_sql": "", "generation_method": "none", "error": True, "message": "Empty prompt."}
             try:
-                response = self.llm.invoke(prompt_text)
+                response = self._llm_invoke_silent(prompt_text)
                 raw = response.content if hasattr(response, "content") else str(response)
                 sql = raw.strip()
                 if sql.startswith("```sql"):
@@ -1901,7 +1921,7 @@ A SQL query was generated for the user's question but it FAILED.
 **Corrected SQL:**"""
 
         try:
-            response = self.llm.invoke(judge_prompt)
+            response = self._llm_invoke_silent(judge_prompt)
             raw = response.content if hasattr(response, "content") else str(response)
             sql = raw.strip()
             if sql.startswith("```sql"):
