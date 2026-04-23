@@ -521,16 +521,24 @@ class CodeEditorNode(Node):
             # Filter schema DDL to show only the target view
             table_schema_ddl = self._filter_schema_ddl(schema_ddl, table_config["table_name"])
 
+            # Per-stage status updates. self.status is shown by the platform UI
+            # (both Playground and Orchestration) as a live chip while the tool
+            # runs, giving the user progressive feedback during long auto-mode
+            # executions instead of a silent "thinking…" for ~60 seconds.
+            _branch_label = table_config.get("label", table_key)
             try:
                 # STAGE 1: Query Analyzer
+                self.status = f"{_branch_label} — analyzing query…"
                 stage1 = self._stage1_query_analyzer(raw_query, knowledge)
                 stage1["spend_type"] = table_key
                 stage1["table_config"] = table_config
 
                 # STAGE 2: Schema Linker
+                self.status = f"{_branch_label} — linking schema…"
                 stage2 = self._stage2_schema_linker(stage1, knowledge, db_data)
 
                 # STAGE 3: Context Builder
+                self.status = f"{_branch_label} — building context…"
                 stage3 = self._stage3_context_builder(stage2, knowledge, provider, table_schema_ddl)
 
                 # Per-branch trace: makes it debuggable when one branch retrieves
@@ -550,9 +558,11 @@ class CodeEditorNode(Node):
                     pass
 
                 # STAGE 4: SQL Generator
+                self.status = f"{_branch_label} — generating SQL…"
                 stage4 = self._stage4_sql_generator(stage3, knowledge)
 
                 # STAGE 5: SQL Processor (with access control)
+                self.status = f"{_branch_label} — executing query…"
                 result_msg = self._stage5_sql_processor(
                     stage4, knowledge, db_data, provider, table_schema_ddl,
                     user_email=user_email, table_config=table_config,
@@ -616,6 +626,7 @@ class CodeEditorNode(Node):
 
         #  Build combined summary if we have numeric data from multiple views
         if len(extracted_data) >= 2:
+            self.status = "merging views into combined summary…"
             summary = self._build_combined_summary(extracted_data, raw_query)
             if summary:
                 combined_parts.append(f"### Combined Summary\n")
