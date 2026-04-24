@@ -35,12 +35,13 @@ import time
 from pathlib import Path
 
 
-# ─── Module-level in-memory cache ─────────────────────────────────────────────
-# Key = sha256 of (direct_kb_name, indirect_kb_name, additional_rules,
-#                  additional_context). Value = (cached_at_epoch, Data).
-# Survives across build_output() calls for the pod's lifetime. Cleared on
-# pod restart or on explicit `refresh`.
-_FROZEN_KNOWLEDGE_CACHE: dict = {}
+# NOTE on caching: the cache lives as a class-level attribute on
+# CodeEditorNode (see below), NOT at module level. The Custom Code component
+# runtime extracts the class definition but does not preserve module-level
+# `var = {}` assignments in the method execution namespace — a bare module
+# global here would raise NameError inside build_output(). Class attributes
+# are always accessible via `type(self)._CACHE` from instance methods, so
+# they're the correct home for shared state in a Custom Code component.
 
 
 # ─── File parsing (ported verbatim from knowledge_processor.py) ──────────────
@@ -747,6 +748,18 @@ class CodeEditorNode(Node):
     icon = "snowflake"
     name = "FrozenKnowledge"
 
+    # Process-wide cache. Stored as a CLASS attribute (not a module global)
+    # because the Custom Code component parses the class body but
+    # strips bare module-level assignments like `_CACHE = {}` from the method
+    # execution namespace — referencing them from inside a method raises
+    # NameError. Class attributes are always visible via self.__class__, and
+    # dict mutations (assignment, pop) persist across instances for the pod
+    # lifetime.
+    # Key   = sha256 of (direct_kb_name, indirect_kb_name, additional_rules,
+    #                    additional_context).
+    # Value = (cached_at_epoch, Data).
+    _CACHE: dict = {}
+
     inputs = [
         MessageTextInput(
             name="direct_kb_name",
@@ -897,8 +910,9 @@ class CodeEditorNode(Node):
             h.update(b"\x00")
         cache_key = h.hexdigest()
 
+        cache = type(self)._CACHE
         if not force_refresh:
-            cached = _FROZEN_KNOWLEDGE_CACHE.get(cache_key)
+            cached = cache.get(cache_key)
             if cached is not None:
                 cached_at, cached_data = cached
                 age_s = time.monotonic() - cached_at
@@ -974,10 +988,10 @@ class CodeEditorNode(Node):
 
         # Store in process-level cache. Bounded at 16 distinct keys — typical
         # deployments only have 1-2 (one config per flow).
-        _FROZEN_KNOWLEDGE_CACHE[cache_key] = (time.monotonic(), result)
-        if len(_FROZEN_KNOWLEDGE_CACHE) > 16:
-            oldest = min(_FROZEN_KNOWLEDGE_CACHE.items(), key=lambda kv: kv[1][0])[0]
-            _FROZEN_KNOWLEDGE_CACHE.pop(oldest, None)
+        cache[cache_key] = (time.monotonic(), result)
+        if len(cache) > 16:
+            oldest = min(cache.items(), key=lambda kv: kv[1][0])[0]
+            cache.pop(oldest, None)
 
         self.status = (
             f"[frozen BUILT] Direct={direct_loaded}/14, Indirect={indirect_loaded}/14, "
