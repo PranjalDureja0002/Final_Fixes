@@ -319,7 +319,17 @@ class CodeEditorNode(Node):
             name="max_rows",
             display_name="Max Result Rows",
             value=100,
-            info="Row limit for query results.",
+            info="Hard ceiling on rows. Any TOP N larger than this is capped.",
+        ),
+        IntInput(
+            name="default_row_limit",
+            display_name="Default Row Limit",
+            value=10,
+            info=(
+                "Default TOP N applied when the user does not specify a limit "
+                "(e.g. 'top suppliers in Germany' -> TOP 10). The LLM is also "
+                "asked to honor this. If the user asks for 'top 25', that wins."
+            ),
         ),
         IntInput(
             name="query_timeout",
@@ -360,8 +370,12 @@ class CodeEditorNode(Node):
         IntInput(
             name="max_examples",
             display_name="Max Few-Shot Examples",
-            value=15,
-            info="More examples = better accuracy but more tokens. Sweet spot: 10-20.",
+            value=20,
+            info=(
+                "Top-K few-shot examples passed to the Stage 4 SQL generator. "
+                "More examples = better accuracy; 20 is the recommended default "
+                "— do not lower for latency reasons (accuracy first)."
+            ),
         ),
         BoolInput(
             name="enable_retry",
@@ -482,67 +496,58 @@ class CodeEditorNode(Node):
             else (rbac_db if isinstance(rbac_db, dict) else {})
         )
 
-        #  Determine which views to query 
+        #  Determine which views to query
         if spend_type == "both":
             tables_to_query = ["direct", "indirect"]
         else:
             tables_to_query = [spend_type]
 
-        #  Run pipeline for each view 
-        all_results = []
-        for table_key in tables_to_query:
-            table_config = TABLE_REGISTRY.get(table_key, TABLE_REGISTRY["direct"])
-
-            # Pick the right knowledge for this view. Tagged structure (from the
-            # Knowledge Processor in dual-KB mode) has "direct" and "indirect"
-            # keys; flat structure is single-view legacy.
+        def _resolve_knowledge(table_key):
+            """Pick the right knowledge dict for a given branch. Mirrors the
+            prior inline logic so parallel and sequential paths stay in sync."""
             if "direct" in knowledge_all and isinstance(knowledge_all.get("direct"), dict):
-                knowledge = knowledge_all.get(table_key, knowledge_all.get("direct", {}))
+                k = knowledge_all.get(table_key, knowledge_all.get("direct", {}))
                 if table_key == "indirect" and not knowledge_all.get("indirect"):
-                    # Tagged structure exists but indirect is missing — we fell
-                    # back to Direct knowledge. This is the exact failure mode
-                    # that silently produced wrong SQL before PR 1.
                     self._log_safe(
                         "[knowledge warning] indirect branch is running with "
                         "DIRECT knowledge because the indirect Knowledge Base "
                         "slot is empty — wire both KBs to the Knowledge "
                         "Processor or expect wrong SQL on the indirect branch."
                     )
-            else:
-                knowledge = knowledge_all  # flat (single-view, backward compat)
-                if table_key == "indirect":
-                    self._log_safe(
-                        "[knowledge warning] indirect branch is running with "
-                        "FLAT (untagged) knowledge — the Knowledge Processor "
-                        "is likely in single-view mode. Connect the indirect "
-                        "Knowledge Base to get correct indirect SQL."
-                    )
+                return k
+            if table_key == "indirect":
+                self._log_safe(
+                    "[knowledge warning] indirect branch is running with "
+                    "FLAT (untagged) knowledge — the Knowledge Processor "
+                    "is likely in single-view mode. Connect the indirect "
+                    "Knowledge Base to get correct indirect SQL."
+                )
+            return knowledge_all
 
-            # Filter schema DDL to show only the target view
-            table_schema_ddl = self._filter_schema_ddl(schema_ddl, table_config["table_name"])
+        def _run_branch(table_key):
+            """Run stages 1-5 for a single view. Returns (table_key, label, Message).
 
-            # Per-stage status updates. self.status is shown by the platform UI
-            # (both Playground and Orchestration) as a live chip while the tool
-            # runs, giving the user progressive feedback during long auto-mode
-            # executions instead of a silent "thinking…" for ~60 seconds.
-            _branch_label = table_config.get("label", table_key)
+            Extracted so auto mode can run direct+indirect concurrently in a
+            ThreadPoolExecutor — the previous sequential loop blew ~60s of
+            wall time because DB and LLM latencies stacked across branches.
+            """
+            table_config = TABLE_REGISTRY.get(table_key, TABLE_REGISTRY["direct"])
+            label = table_config.get("label", table_key)
             try:
-                # STAGE 1: Query Analyzer
-                self.status = f"{_branch_label} — analyzing query…"
+                knowledge = _resolve_knowledge(table_key)
+                table_schema_ddl = self._filter_schema_ddl(schema_ddl, table_config["table_name"])
+
+                self.status = f"{label} — analyzing query…"
                 stage1 = self._stage1_query_analyzer(raw_query, knowledge)
                 stage1["spend_type"] = table_key
                 stage1["table_config"] = table_config
 
-                # STAGE 2: Schema Linker
-                self.status = f"{_branch_label} — linking schema…"
+                self.status = f"{label} — linking schema…"
                 stage2 = self._stage2_schema_linker(stage1, knowledge, db_data)
 
-                # STAGE 3: Context Builder
-                self.status = f"{_branch_label} — building context…"
+                self.status = f"{label} — building context…"
                 stage3 = self._stage3_context_builder(stage2, knowledge, provider, table_schema_ddl)
 
-                # Per-branch trace: makes it debuggable when one branch retrieves
-                # wildly different examples or aliases than the other.
                 try:
                     _ex_ids = [e.get("id") for e in stage3.get("selected_examples", [])
                                if isinstance(e, dict)]
@@ -554,42 +559,60 @@ class CodeEditorNode(Node):
                         f"aliases={sorted((stage2.get('resolved_aliases') or {}).keys())}"
                     )
                 except Exception:
-                    # Tracing must never break the pipeline; worst case we lose a log line.
                     pass
 
-                # STAGE 4: SQL Generator
-                self.status = f"{_branch_label} — generating SQL…"
+                self.status = f"{label} — generating SQL…"
                 stage4 = self._stage4_sql_generator(stage3, knowledge)
 
-                # STAGE 5: SQL Processor (with access control)
-                self.status = f"{_branch_label} — executing query…"
+                self.status = f"{label} — executing query…"
                 result_msg = self._stage5_sql_processor(
                     stage4, knowledge, db_data, provider, table_schema_ddl,
                     user_email=user_email, table_config=table_config,
                     rbac_db_data=rbac_db_data,
                 )
-
-                all_results.append((table_key, table_config.get("label", table_key), result_msg))
-
+                return (table_key, label, result_msg, None)
             except Exception as e:
-                # Surface the full traceback with branch context so an Indirect
-                # failure during auto mode doesn't disappear into the combined
-                # summary. The user-visible text stays concise; the traceback
-                # goes to the logger for debugging.
                 tb = traceback.format_exc()
-                self._log_safe(
-                    f"[pipeline error] table={table_key} "
-                    f"label={table_config.get('label', table_key)!r} "
-                    f"error={type(e).__name__}: {e}\n{tb}"
-                )
-                error_text = (
-                    f"**Pipeline error ({table_config.get('label', table_key)}):** "
-                    f"{type(e).__name__}: {e}\n\n"
-                    f"_This branch failed — the other branch(es) and combined "
-                    f"summary reflect only the successful view(s)._"
-                )
-                all_results.append((table_key, table_config.get("label", table_key),
-                                    Message(text=error_text)))
+                return (table_key, label, None, (e, tb))
+
+        #  Run pipeline for each view — parallel when more than one branch
+        all_results = []
+        if len(tables_to_query) > 1:
+            # Auto mode: fire both branches concurrently. Each branch has its
+            # own LLM calls and its own DB query, so they do not share any
+            # mutable state. The DB driver used here (pyodbc via Data object)
+            # creates a new cursor per query, so concurrent calls are safe.
+            # If a deployment ever has a stricter driver, flip the following
+            # worker count to 1 — behavior falls back to sequential.
+            from concurrent.futures import ThreadPoolExecutor
+            self.status = f"auto mode — running {len(tables_to_query)} branches in parallel…"
+            with ThreadPoolExecutor(max_workers=len(tables_to_query)) as pool:
+                futures = [pool.submit(_run_branch, tk) for tk in tables_to_query]
+                branch_out = [f.result() for f in futures]
+            # Preserve tables_to_query order (direct first, then indirect) so
+            # the combined summary section reads in a consistent order.
+            branch_by_key = {bo[0]: bo for bo in branch_out}
+            ordered = [branch_by_key[tk] for tk in tables_to_query if tk in branch_by_key]
+        else:
+            ordered = [_run_branch(tables_to_query[0])]
+
+        for table_key, label, result_msg, err in ordered:
+            if err is None:
+                all_results.append((table_key, label, result_msg))
+                continue
+            # --- failure path: same user-facing payload as the prior version ---
+            e, tb = err
+            self._log_safe(
+                f"[pipeline error] table={table_key} label={label!r} "
+                f"error={type(e).__name__}: {e}\n{tb}"
+            )
+            error_text = (
+                f"**Pipeline error ({label}):** "
+                f"{type(e).__name__}: {e}\n\n"
+                f"_This branch failed — the other branch(es) and combined "
+                f"summary reflect only the successful view(s)._"
+            )
+            all_results.append((table_key, label, Message(text=error_text)))
 
         #  Combine results if multiple views 
         if len(all_results) == 1:
@@ -1165,14 +1188,23 @@ class CodeEditorNode(Node):
         extracted_numbers = [int(m) for m in re.findall(r"\b(\d+)\b", text)]
 
         #  Fiscal year resolution  convert FY references to concrete date ranges
-        # Supported formats: FY25, FY'25, FY 25, FY2025, FY24/25, FY2024/2025, FY2024/25
-        # Convention: FY25 = April 1, 2024 to March 31, 2025 (ending-year)
-        # FY24/25 = April 1, 2024 to March 31, 2025 (second number is ending year)
+        # Supported formats:
+        #   - FY25, FY'25, FY 25, FY2025                              (simple)
+        #   - FY24/25, FY 2024/25, FY2024/2025                        (slash with FY prefix)
+        #   - 2025-26, 2025/26, 2025-2026                             (bare YYYY-YY/YYYY)
+        #   - FY 2025-26, fiscal year 2025-26                         (prefix + YYYY-YY)
+        # Convention: the ending year names the FY. FY25 = Apr 2024-Mar 2025.
+        # "2025-26" must have end = start+1 (e.g. 2025-26 or 2025-2026) to match
+        # — this prevents false positives on random hyphenated numbers/dates.
         # Supports MULTIPLE FY references: "FY25 vs FY26" → range spans both
         fy_resolved = None
-        _fy_all = []  # collect all resolved FYs
+        _fy_all = []
 
-        # Find ALL slash-format FYs: FY24/25, FY2024/2025
+        # Claimed character positions — later patterns skip any position
+        # already owned by an earlier, more-specific match.
+        _claimed_spans: set = set()
+
+        # 1. FY-prefixed slash format: FY24/25, FY 2024/2025
         for _m in re.finditer(r"\bFY\s*'?(\d{2,4})\s*/\s*(\d{2,4})\b", text, re.IGNORECASE):
             _s = int(_m.group(1))
             _e = int(_m.group(2))
@@ -1180,17 +1212,46 @@ class CodeEditorNode(Node):
             if _e < 100: _e = 2000 + _e
             _fy_all.append({"original": _m.group(0), "fy_year": _e,
                             "start_date": f"{_s}-04-01", "end_date": f"{_e}-03-31"})
+            _claimed_spans.update(range(_m.start(), _m.end()))
 
-        # Find ALL simple FYs: FY25, FY'25, FY 2025 (skip positions already matched by slash)
-        _slash_spans = {pos for _m in re.finditer(r"\bFY\s*'?(\d{2,4})\s*/\s*(\d{2,4})\b", text, re.IGNORECASE)
-                        for pos in range(_m.start(), _m.end())}
+        # 2. Bare range format: "2025-26", "2025/26", "2025-2026". Accepts with
+        # or without a preceding "FY" / "fiscal year". Requires end = start + 1
+        # so it doesn't false-match random hyphenated numbers or ISO dates.
+        # This is the pattern users most commonly type ("last fiscal year i.e.
+        # 2025-26") — without it the resolver falls to `None` and the SQL LLM
+        # picks its own (often wrong) year range.
+        for _m in re.finditer(r"\b(\d{4})\s*[-/]\s*(\d{2,4})\b", text):
+            if any(p in _claimed_spans for p in range(_m.start(), _m.end())):
+                continue
+            _s = int(_m.group(1))
+            _e_raw = int(_m.group(2))
+            # Anchor to the modern fiscal-year window so 1999-00 or 2050-51
+            # don't accidentally resolve.
+            if _s < 2000 or _s > 2049:
+                continue
+            if _e_raw < 100:
+                if _e_raw != (_s + 1) % 100:
+                    continue
+                _e = _s + 1
+            else:
+                if _e_raw != _s + 1:
+                    continue
+                _e = _e_raw
+            _fy_all.append({"original": _m.group(0), "fy_year": _e,
+                            "start_date": f"{_s}-04-01", "end_date": f"{_e}-03-31"})
+            _claimed_spans.update(range(_m.start(), _m.end()))
+
+        # 3. Simple FY: FY25, FY'25, FY 2025 — skip any overlap with #1 or #2
+        # (e.g. in "FY 2025-26" the bare-range match already claimed "2025-26",
+        # so the simple pattern doesn't double-book it as FY2025 = FY25).
         for _m in re.finditer(r"\bFY\s*'?(\d{2,4})\b", text, re.IGNORECASE):
-            if _m.start() in _slash_spans:
+            if any(p in _claimed_spans for p in range(_m.start(), _m.end())):
                 continue
             _n = int(_m.group(1))
             if _n < 100: _n = 2000 + _n
             _fy_all.append({"original": _m.group(0), "fy_year": _n,
                             "start_date": f"{_n - 1}-04-01", "end_date": f"{_n}-03-31"})
+            _claimed_spans.update(range(_m.start(), _m.end()))
 
         if _fy_all:
             # Use the widest range across all mentioned FYs
@@ -1701,10 +1762,13 @@ Return ONLY JSON."""
                     f"  You MUST use exactly these dates. Do NOT use G_JAHR. Do NOT compute different dates.\n"
                 )
 
+        default_limit = getattr(self, "default_row_limit", 10) or 10
         if provider == "sqlserver":
             sections.append(
                 f"\n**SQL Server Rules:**\n"
-                f"1. Use SELECT TOP {mr} ... (NEVER LIMIT, NEVER FETCH FIRST)\n"
+                f"1. Use SELECT TOP N (NEVER LIMIT, NEVER FETCH FIRST). "
+                f"If the user explicitly asks for 'top N', 'first N', or 'N suppliers/plants/etc.', "
+                f"use that N. Otherwise default to TOP {default_limit}. Hard ceiling is {mr}.\n"
                 f"2. Use ISNULL() where needed, UPPER() for case-insensitive text matching\n"
                 f"3. MANDATORY: EVERY query must include date filter: INVOICE_DATE >= '2024-04-01'\n"
                 f"4. Use GETDATE() for relative date calculations (DATEADD, last N months). For fiscal year boundaries, use the concrete dates from Temporal Context.\n"
@@ -2922,6 +2986,28 @@ A SQL query was generated for the user's question but it FAILED.
             sql = re.sub(r"\bSELECT\s+TOP\s+\d+", f"SELECT TOP {mr}", sql, flags=re.IGNORECASE)
             all_fixes.append(f"Capped TOP {old_n} -> {mr}")
 
+        # Inject default TOP N when none is present. We ALWAYS inject — even
+        # for "list all / export all" style questions — because the
+        # Orchestration UI visibly chokes when a response carries hundreds of
+        # rows of HTML table. If the user genuinely wants more, they can
+        # follow up with "top 50" / "top 100" and the LLM will emit an
+        # explicit TOP. Aggregate-only queries are unaffected (TOP N on a
+        # 1-row result is a no-op). The "ctx['injected_default_top']" flag
+        # below is consumed by stage 5's output builder to append a one-line
+        # follow-up hint to the user.
+        default_limit = getattr(self, "default_row_limit", 10) or 10
+        default_limit = max(1, min(int(default_limit), mr))
+        if not re.search(r"\bSELECT\s+(DISTINCT\s+)?TOP\s+\d+", sql, re.IGNORECASE):
+            sql = re.sub(
+                r"\bSELECT\b(\s+DISTINCT\b)?",
+                lambda m: f"SELECT{m.group(1) or ''} TOP {default_limit}",
+                sql,
+                count=1,
+                flags=re.IGNORECASE,
+            )
+            all_fixes.append(f"Injected default TOP {default_limit} (no limit in query)")
+            ctx["injected_default_top"] = default_limit
+
         # Remove redundant fiscal year filters
         for pat, label in [
             (r"\s*AND\s+FORMAT\s*\(\s*INVOICE_DATE\s*,\s*'yyyy'\s*\)\s*=\s*FORMAT\s*\(\s*GETDATE\s*\(\s*\)\s*,\s*'yyyy'\s*\)", "FORMAT fiscal year"),
@@ -3161,6 +3247,16 @@ A SQL query was generated for the user's question but it FAILED.
         if rows:
             parts.append(result_table)
             parts.append(f"\n*{len(rows)} row{'s' if len(rows) != 1 else ''} returned in {exec_ms}ms*")
+            # Follow-up hint: when we auto-capped the query AND the result is
+            # at the cap, let the user know more rows may exist so the UI can
+            # stay lean by default.
+            injected_top = ctx.get("injected_default_top")
+            if injected_top and len(rows) >= injected_top:
+                parts.append(
+                    f"\n> _Showing the default TOP {injected_top} rows to keep the "
+                    f"response snappy. Reply with **'top 50'**, **'top 100'**, or "
+                    f"**'show more'** to widen the result._"
+                )
         else:
             parts.append("**No results found.** The filters may be too restrictive  try broadening your search.")
 
